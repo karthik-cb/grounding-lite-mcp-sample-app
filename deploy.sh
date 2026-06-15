@@ -49,10 +49,9 @@ fi
 SERVER_API_KEY=$(get_env_key "SERVER_API_KEY")
 MAPS_API_KEY=$(get_env_key "MAPS_API_KEY")
 
-# Optional: AI provider selection (defaults to "gemini" when unset).
+# Optional provider/tuning settings (defaults applied in-app when unset).
 AI_PROVIDER=$(get_env_key "AI_PROVIDER")
 CEREBRAS_API_KEY=$(get_env_key "CEREBRAS_API_KEY")
-CEREBRAS_MODEL=$(get_env_key "CEREBRAS_MODEL")
 
 # Validate that keys were successfully read
 if [ -z "$SERVER_API_KEY" ]; then
@@ -71,11 +70,13 @@ if [ "$AI_PROVIDER" = "cerebras" ] && [ -z "$CEREBRAS_API_KEY" ]; then
     exit 1
 fi
 
-# Build the env-vars list, appending Cerebras settings only when present.
+# Build the env-vars list, appending optional provider/tuning settings only when present.
 ENV_VARS="SERVER_API_KEY=${SERVER_API_KEY},MAPS_API_KEY=${MAPS_API_KEY}"
-[ -n "$AI_PROVIDER" ] && ENV_VARS="${ENV_VARS},AI_PROVIDER=${AI_PROVIDER}"
-[ -n "$CEREBRAS_API_KEY" ] && ENV_VARS="${ENV_VARS},CEREBRAS_API_KEY=${CEREBRAS_API_KEY}"
-[ -n "$CEREBRAS_MODEL" ] && ENV_VARS="${ENV_VARS},CEREBRAS_MODEL=${CEREBRAS_MODEL}"
+OPTIONAL_KEYS="AI_PROVIDER CEREBRAS_API_KEY CEREBRAS_MODEL CEREBRAS_REASONING_EFFORT CEREBRAS_TEMPERATURE CEREBRAS_TOP_P CEREBRAS_STRICT_TOOLS CEREBRAS_MAX_IMAGES CEREBRAS_MAX_PAYLOAD_MB"
+for key in $OPTIONAL_KEYS; do
+    value=$(get_env_key "$key")
+    [ -n "$value" ] && ENV_VARS="${ENV_VARS},${key}=${value}"
+done
 
 echo "--- Deploying to Google Cloud Run ---"
 echo "Project: $GCP_PROJECT_ID"

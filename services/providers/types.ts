@@ -52,6 +52,17 @@ export interface TurnResult {
 }
 
 /**
+ * Client-facing per-request limits a provider advertises (served to the frontend
+ * so the upload UI can cap/validate, and so providers without image support hide it).
+ */
+export interface ProviderLimits {
+  /** Max images per request. 0 means this provider does not accept image input. */
+  maxImages: number;
+  /** Total image payload budget per request, in megabytes (0 when unsupported). */
+  maxPayloadMb: number;
+}
+
+/**
  * A pluggable conversational AI backend (e.g. Gemini, Cerebras/Gemma).
  * The facade in `conversationalAIService.ts` owns MCP setup, the system prompt,
  * session management and tool-exchange post-processing; a provider only owns
@@ -62,6 +73,8 @@ export interface AIProvider {
   readonly modelName: string;
   /** Short provider label used in status messages, e.g. "Gemini" / "Gemma". */
   readonly displayName: string;
+  /** Per-request limits advertised to the client (image count / payload budget). */
+  readonly limits: ProviderLimits;
   /** Create a fresh chat session bound to the given MCP client and system prompt. */
   initSession(opts: InitSessionOptions): Promise<void>;
   /** Send one user turn (optional base64 image data URLs) and return its result. */

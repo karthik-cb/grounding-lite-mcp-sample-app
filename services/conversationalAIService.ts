@@ -20,7 +20,7 @@ import { ToolExchange } from '../types.js';
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { callRoutesApiV2 } from './complementaryServices.js';
-import type { AIProvider } from './providers/types.js';
+import type { AIProvider, ProviderLimits } from './providers/types.js';
 import { GeminiProvider } from './providers/geminiProvider.js';
 import { CerebrasProvider } from './providers/cerebrasProvider.js';
 
@@ -148,6 +148,12 @@ You have three tools available:
   - **Ambiguity:** If "here" is ambiguous (e.g., multiple recent places), ASK for clarification. DO NOT GUESS.
 
 - **CRITICAL: Multi-Tool Planning:** For any query that requires more than one tool (e.g., Route + Weather), you MUST first generate a brief internal plan listing the required tool calls before executing the first one. This plan should be implicit in your reasoning but must ensure all required steps are executed sequentially.
+
+- **For Image Inputs (Multimodal):** The user may attach one or more images (for example, a screenshot of a map, or a photo of a place, landmark, storefront, or street sign), usually together with a text intent.
+  - First, analyze the image together with the user's text to understand what they want.
+  - Then decide whether your tools can help: if the image depicts or references a real-world place, location, landmark, neighborhood, or address, treat the image as a grounding cue. Identify the location from visual details (map labels, signage, landmarks, terrain) and then use 'search_places' (and 'lookup-weather' / 'compute-routes' as appropriate) to provide grounded, verified information, following ALL the indexing and data-usage rules above.
+  - If the image is NOT related to maps, places, or geography, just respond helpfully based on the image and the user's intent without calling any tools.
+  - **CRITICAL:** Never present place names, addresses, ratings, or other specifics inferred from the image as fact. Anything you read from an image is only a hint for forming a tool query; you MUST verify it with 'search_places' before stating it in your response.
 `;
 
 /**
@@ -163,12 +169,14 @@ const getSystemInstruction = (): string => {
 
 const MCP_URL = 'https://mapstools.googleapis.com/mcp';
 
-export const initChatSession = async (initialHistory?: Content[]): Promise<{ success: boolean, modelName: string }> => {
+const NO_LIMITS: ProviderLimits = { maxImages: 0, maxPayloadMb: 0 };
+
+export const initChatSession = async (initialHistory?: Content[]): Promise<{ success: boolean, modelName: string, limits: ProviderLimits }> => {
   const serverApiKey = process.env.SERVER_API_KEY;
   console.log(`[initChatSession] Checking for SERVER_API_KEY... ${serverApiKey ? 'found.' : 'not set or empty.'}`);
   if (!serverApiKey) {
     console.error("CRITICAL: SERVER_API_KEY environment variable is not set (required for the Google Maps MCP server).");
-    return { success: false, modelName: provider?.modelName || 'unknown' };
+    return { success: false, modelName: provider?.modelName || 'unknown', limits: provider?.limits ?? NO_LIMITS };
   }
 
   // Reuse MCP client if already initialized, but ALWAYS reset the chat session.
@@ -207,7 +215,7 @@ export const initChatSession = async (initialHistory?: Content[]): Promise<{ suc
     } catch (error) {
       console.error("Error initializing MCP client:", error);
       mcpClientInstance = null;
-      return { success: false, modelName: provider?.modelName || 'unknown' };
+      return { success: false, modelName: provider?.modelName || 'unknown', limits: provider?.limits ?? NO_LIMITS };
     }
   }
 
@@ -228,10 +236,10 @@ export const initChatSession = async (initialHistory?: Content[]): Promise<{ suc
     lastInteractionTimestamp = Date.now();
 
     trace(`Chat session initialized with provider '${provider.displayName}' (model: ${provider.modelName}).`);
-    return { success: true, modelName: provider.modelName };
+    return { success: true, modelName: provider.modelName, limits: provider.limits };
   } catch (error) {
     console.error("Error initializing chat session with provider:", error);
-    return { success: false, modelName: provider?.modelName || 'unknown' };
+    return { success: false, modelName: provider?.modelName || 'unknown', limits: provider?.limits ?? NO_LIMITS };
   } finally {
     // Ensure the handler is reset after init, regardless of success/failure
     currentStatusHandler = null;

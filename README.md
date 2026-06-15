@@ -125,10 +125,30 @@ CEREBRAS_MODEL="gemma-4-31b-trial"
 authenticates the Google Maps Grounding Lite MCP server that supplies the
 `search_places`, `lookup_weather`, and `compute_routes` tools.
 
-The Cerebras path additionally supports **multimodal image input**: `POST /api/chat`
-accepts an optional `images` array of base64 data URLs (`data:image/png;base64,...`,
-PNG/JPEG only, up to 5 per request). The frontend upload UI for this is a planned
-follow-up; the backend already accepts and forwards the images.
+#### Optional Cerebras/Gemma tuning (all have sensible preview defaults)
+
+These knobs are expected to change between the private preview and public
+availability, so they are environment-configurable:
+
+```
+# Generation tuning (defaults match Cerebras' recommendation for Gemma)
+CEREBRAS_REASONING_EFFORT="medium"   # none | low | medium | high
+CEREBRAS_TEMPERATURE="0.8"
+CEREBRAS_TOP_P="0.95"
+CEREBRAS_STRICT_TOOLS="true"         # strict (constrained-decoding) tool calling
+
+# Multimodal image limits
+CEREBRAS_MAX_IMAGES="5"               # images per request
+CEREBRAS_MAX_PAYLOAD_MB="10"          # total image payload budget per request (MB)
+```
+
+The Cerebras path supports **multimodal image input**: `POST /api/chat` accepts an
+optional `images` array of base64 data URLs (`data:image/png;base64,...`, PNG/JPEG
+only). The frontend exposes an attach button (plus drag-and-drop and paste); the
+image count and payload limits above are enforced on both the client and server and
+are advertised to the UI via `/api/init-chat` (so the upload UI is hidden when the
+active provider — e.g. Gemini — does not accept images). The Express request body
+limit tracks `CEREBRAS_MAX_PAYLOAD_MB` automatically.
 
 ## Architecture
 

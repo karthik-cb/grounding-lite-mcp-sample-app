@@ -37,6 +37,9 @@ const MODEL_NAME = 'gemini-2.5-flash-preview-09-2025';
 export class GeminiProvider implements AIProvider {
   readonly modelName = MODEL_NAME;
   readonly displayName = 'Gemini';
+  // Image input is not wired into the Gemini path in this scope; advertise none
+  // so the frontend hides the image-upload UI when Gemini is the active provider.
+  readonly limits = { maxImages: 0, maxPayloadMb: 0 };
 
   private ai: GoogleGenAI | null = null;
   private chat: Chat | null = null;

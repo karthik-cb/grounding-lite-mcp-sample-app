@@ -97,6 +97,7 @@ export interface ChatMessage {
   places?: Place[]; // Optional places associated with the message
   toolExchanges?: ToolExchange[]; // Optional array of tool calls and responses made during this turn
   sourceURLs?: string[]; // Optional list of source URLs extracted from tool responses
+  images?: string[]; // Optional base64 image data URLs the user attached to this message
 }
 
 export interface FailedToolResponse {

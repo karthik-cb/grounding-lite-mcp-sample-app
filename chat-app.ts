@@ -105,6 +105,18 @@ export class ChatApp extends LitElement {
   @state()
   private userInput: string = '';
 
+  // Base64 image data URLs (PNG/JPEG) the user has attached to the next message.
+  @state()
+  private attachedImages: string[] = [];
+
+  // Transient notice when an attachment is rejected (wrong format) or truncated (>max).
+  @state()
+  private attachmentNotice: string | null = null;
+
+  // Whether a file is currently being dragged over the input area (for drop styling).
+  @state()
+  private isDraggingOver: boolean = false;
+
   @state()
   private chatHistory: ChatMessage[] = [];
 
@@ -180,6 +192,18 @@ export class ChatApp extends LitElement {
 
   @query('#map-3d')
   private mapRef!: HTMLElement; // Reference to gmp-map-3d element
+
+  @query('#image-input')
+  private imageInputRef!: HTMLInputElement; // Hidden file input for image attachments
+
+  // Per-request image limits advertised by the backend via /api/init-chat
+  // (provider-aware: 0 means the active provider does not accept image input,
+  // which hides the upload UI). Populated when the chat session initializes.
+  @state()
+  private maxImages = 0;
+  @state()
+  private maxPayloadBytes = 0;
+  private readonly ACCEPTED_IMAGE_TYPES = ['image/png', 'image/jpeg'];
 
 
   // Internal state for imperative map objects (mostly removed for declarative 3D map)
@@ -511,8 +535,12 @@ export class ChatApp extends LitElement {
       this.isLoading = true;
       fetch('/api/init-chat', { method: 'POST' })
         .then(res => res.json())
-        .then(({ success, modelName }) => {
+        .then(({ success, modelName, limits }) => {
           this.modelName = modelName;
+          if (limits) {
+            this.maxImages = limits.maxImages ?? 0;
+            this.maxPayloadBytes = (limits.maxPayloadMb ?? 0) * 1024 * 1024;
+          }
           if (success) {
             const modelDisplay = modelName ? `<div class="text-xs text-gray-400 mt-2 text-right">Powered by ${modelName}</div>` : '';
             const githubButton = `
@@ -861,7 +889,8 @@ ${buttonContainer}`
     routeData?: RouteData,
     places?: Place[],
     toolExchanges?: ToolExchange[],
-    sourceURLs?: string[] // Pass sources explicitly
+    sourceURLs?: string[], // Pass sources explicitly
+    images?: string[] // base64 image data URLs the user attached
   ) {
     const existingMsgIndex = this.chatHistory.findIndex(m => m.id === id);
 
@@ -876,7 +905,8 @@ ${buttonContainer}`
       routeData,
       places,
       toolExchanges,
-      sourceURLs // Store sources in the message
+      sourceURLs, // Store sources in the message
+      images // Store attached images for display
     };
 
 
@@ -967,7 +997,7 @@ ${buttonContainer}`
     return waypoint;
   }
 
-  private async processAiResponse(currentUserMessageText: string) {
+  private async processAiResponse(currentUserMessageText: string, images?: string[]) {
     this.isLoading = true;
     this.currentAiMessageIdRef = generateId();
     this.addOrUpdateMessageInChat(this.currentAiMessageIdRef, 'model', [{ text: "Connecting to agent..." }], false);
@@ -978,7 +1008,7 @@ ${buttonContainer}`
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ message: currentUserMessageText }),
+        body: JSON.stringify({ message: currentUserMessageText, images }),
       });
 
       if (!response.body) {
@@ -1265,15 +1295,123 @@ ${buttonContainer}`
     }
   }
 
+  // --- Image attachment handling ---
+
+  private fileToDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // Validate against the count limit and payload budget, then add files as base64 data URLs.
+  private async addImageFiles(files: File[]) {
+    if (this.isLoading || this.maxImages <= 0) return;
+    const accepted = files.filter(f => this.ACCEPTED_IMAGE_TYPES.includes(f.type));
+    const rejectedCount = files.length - accepted.length;
+
+    const room = this.maxImages - this.attachedImages.length;
+    const toAdd = accepted.slice(0, Math.max(0, room));
+    const truncatedCount = accepted.length - toAdd.length;
+
+    const notices: string[] = [];
+    if (rejectedCount > 0) notices.push(`${rejectedCount} file(s) skipped (only PNG and JPEG are supported).`);
+    if (truncatedCount > 0) notices.push(`You can attach at most ${this.maxImages} image(s).`);
+
+    if (toAdd.length > 0) {
+      try {
+        const dataUrls = await Promise.all(toAdd.map(f => this.fileToDataUrl(f)));
+        // Enforce the per-request payload budget (base64 data URLs dominate the body).
+        let runningBytes = this.attachedImages.reduce((sum, url) => sum + url.length, 0);
+        const within: string[] = [];
+        let oversizeCount = 0;
+        for (const url of dataUrls) {
+          if (this.maxPayloadBytes > 0 && runningBytes + url.length > this.maxPayloadBytes) {
+            oversizeCount++;
+            continue;
+          }
+          runningBytes += url.length;
+          within.push(url);
+        }
+        if (oversizeCount > 0) {
+          notices.push(`${oversizeCount} image(s) skipped (exceeds the ${Math.round(this.maxPayloadBytes / (1024 * 1024))} MB request limit).`);
+        }
+        if (within.length > 0) this.attachedImages = [...this.attachedImages, ...within];
+      } catch (e) {
+        console.error('Failed to read image file(s):', e);
+        notices.push('Failed to read one or more images. Please try again.');
+      }
+    }
+
+    this.attachmentNotice = notices.length > 0 ? notices.join(' ') : null;
+  }
+
+  private async handleFileSelect(e: Event) {
+    const input = e.target as HTMLInputElement;
+    if (input.files && input.files.length > 0) {
+      await this.addImageFiles(Array.from(input.files));
+    }
+    input.value = ''; // reset so the same file can be re-selected
+  }
+
+  private removeAttachedImage(index: number) {
+    this.attachedImages = this.attachedImages.filter((_, i) => i !== index);
+    if (this.attachedImages.length === 0) this.attachmentNotice = null;
+  }
+
+  private handleDragOver(e: DragEvent) {
+    if (this.isLoading) return;
+    if (e.dataTransfer?.types?.includes('Files')) {
+      e.preventDefault();
+      this.isDraggingOver = true;
+    }
+  }
+
+  private handleDragLeave(_e: DragEvent) {
+    this.isDraggingOver = false;
+  }
+
+  private async handleDrop(e: DragEvent) {
+    e.preventDefault();
+    this.isDraggingOver = false;
+    const files = e.dataTransfer?.files;
+    if (files && files.length > 0) {
+      await this.addImageFiles(Array.from(files));
+    }
+  }
+
+  // Allow pasting image data (e.g. a map screenshot) directly into the input.
+  private async handlePaste(e: ClipboardEvent) {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const files: File[] = [];
+    for (const item of Array.from(items)) {
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file) files.push(file);
+      }
+    }
+    if (files.length > 0) {
+      e.preventDefault();
+      await this.addImageFiles(files);
+    }
+  }
+
   private handleSendMessage(e?: Event) {
     e?.preventDefault();
     const currentInput = this.userInput.trim();
+    const hasImages = this.attachedImages.length > 0;
     const areAllKeysConfigured = this.apiKeysState.geminiApiKeySet && GOOGLE_MAPS_API_KEY;
 
-    if (!currentInput || this.isLoading || !areAllKeysConfigured) return;
+    if ((!currentInput && !hasImages) || this.isLoading || !areAllKeysConfigured) return;
 
-    let messageToSend = currentInput;
-    this.lastUserMessageContent = currentInput; // Store the original user input for potential retry
+    // When only images are attached, supply a default intent so the agent has a prompt.
+    const effectiveInput = currentInput || 'Analyze the attached image and tell me about the location it shows.';
+
+    let messageToSend = effectiveInput;
+    this.lastUserMessageContent = effectiveInput; // Store the original user input for potential retry
 
     // --- Step 2: Handle Origin Input (if awaiting) ---
     if (this.isAwaitingRouteOrigin && this.pendingRouteDestination) {
@@ -1316,14 +1454,16 @@ ${buttonContainer}`
       return;
     } else if (this.lastSelectedPlace) {
       const placeName = this.lastSelectedPlace.displayName?.text || `place with ID ${this.lastSelectedPlace.id}`;
-      messageToSend = `${currentInput} (near ${placeName})`;
+      messageToSend = `${effectiveInput} (near ${placeName})`;
     }
 
-    this.addOrUpdateMessageInChat(generateId(), 'user', [{ text: currentInput }]);
+    const imagesToSend = hasImages ? this.attachedImages : undefined;
+    this.addOrUpdateMessageInChat(generateId(), 'user', [{ text: effectiveInput }], true, undefined, undefined, undefined, undefined, undefined, undefined, imagesToSend);
     this.userInput = '';
+    this.attachedImages = [];
+    this.attachmentNotice = null;
     this.selectedPlaceIdForDetails = null;
-    this.processAiResponse(messageToSend);
-    this.lastSelectedPlace = null; // Clear the context after it's been used
+    this.processAiResponse(messageToSend, imagesToSend);
     this.lastSelectedPlace = null; // Clear the context after it's been used
   }
 
@@ -1934,6 +2074,11 @@ ${buttonContainer}`
                     ${msg.weatherData ? html`<weather-display .weather=${msg.weatherData}></weather-display>` : ''}
                     <!-- TODO: Add a placeholder at the end of the response -->
                     ${msg.routeData ? html`<route-display .route=${msg.routeData}></route-display>` : ''}
+                    ${msg.images && msg.images.length > 0 ? html`
+                      <div class="flex flex-wrap gap-2 mb-2">
+                        ${msg.images.map((src) => html`<img src=${src} alt="Attached image" class="h-24 w-24 object-cover rounded-lg border border-white/40" />`)}
+                      </div>
+                    ` : ''}
                     ${msg.parts && msg.parts.length > 0 ? this.renderPart(msg.parts[0], 0, msg) : ''}
                     ${msg.error && !msg.parts[0]?.text?.includes(msg.error) ? html`
                         <p class="text-red-700 text-xs mt-1 font-semibold chat-message-content">Error: ${msg.error}</p>
@@ -2011,13 +2156,58 @@ ${buttonContainer}`
                 `)}
                 </div>
               </div>
-              <form @submit=${this.handleSendMessage}>
+              <form
+                @submit=${this.handleSendMessage}
+                @dragover=${this.handleDragOver}
+                @dragleave=${this.handleDragLeave}
+                @drop=${this.handleDrop}
+                class=${this.isDraggingOver ? 'rounded-2xl ring-2 ring-[#006780] ring-offset-2 transition' : 'transition'}
+              >
+                ${this.attachedImages.length > 0 ? html`
+                  <div class="flex flex-wrap gap-2 mb-2 px-1">
+                    ${this.attachedImages.map((src, i) => html`
+                      <div class="relative">
+                        <img src=${src} alt="Attachment preview" class="h-14 w-14 object-cover rounded-lg border border-gray-300 shadow-sm" />
+                        <button
+                          type="button"
+                          @click=${() => this.removeAttachedImage(i)}
+                          class="absolute -top-1.5 -right-1.5 bg-black/70 text-white rounded-full w-5 h-5 text-xs leading-none flex items-center justify-center hover:bg-black"
+                          aria-label="Remove image"
+                        >&times;</button>
+                      </div>
+                    `)}
+                  </div>
+                ` : ''}
+                ${this.attachmentNotice ? html`<p class="text-xs text-amber-600 mb-1 px-2">${this.attachmentNotice}</p>` : ''}
                 <div class="flex items-center">
+                  ${this.maxImages > 0 ? html`
+                    <input
+                      type="file"
+                      id="image-input"
+                      accept="image/png,image/jpeg"
+                      multiple
+                      class="hidden"
+                      @change=${this.handleFileSelect}
+                    />
+                    <button
+                      type="button"
+                      @click=${() => this.imageInputRef?.click()}
+                      ?disabled=${this.isLoading || !areAllKeysConfigured || this.attachedImages.length >= this.maxImages}
+                      class="p-2 mr-1 text-[#006780] hover:text-[#004F63] disabled:text-[#A0A5AA] disabled:cursor-not-allowed focus:outline-none flex-shrink-0"
+                      aria-label="Attach image"
+                      title="Attach an image (PNG or JPEG, up to ${this.maxImages})"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3.75 19.5h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5zm10.5-11.25a.75.75 0 11-1.5 0 .75.75 0 011.5 0z" />
+                      </svg>
+                    </button>
+                  ` : ''}
                   <input
                     type="text"
                     .value=${this.userInput}
                     @input=${(e: Event) => this.userInput = (e.target as HTMLInputElement).value}
-                    placeholder=${this.isAwaitingRouteOrigin ? "Enter your starting point (origin)" : (areAllKeysConfigured ? "Enter a location search" : "API keys must be configured.")}
+                    @paste=${this.handlePaste}
+                    placeholder=${this.isAwaitingRouteOrigin ? "Enter your starting point (origin)" : (areAllKeysConfigured ? (this.maxImages > 0 ? "Ask about a place, or attach an image" : "Enter a location search") : "API keys must be configured.")}
                     class="flex-grow p-3 text-sm text-[#1A1C1E] bg-[#F0F2F5] rounded-l-full focus:outline-none disabled:opacity-50 shadow"
                     ?disabled=${this.isLoading || !areAllKeysConfigured}
                     aria-label="User input"
@@ -2026,7 +2216,7 @@ ${buttonContainer}`
                   <button
                     type="submit"
                     class="bg-[#006780] text-white p-[10px] rounded-r-full hover:bg-[#004F63] active:bg-[#42474E] focus:outline-none focus:ring-2 focus:ring-[#006780] disabled:bg-[#A0A5AA] disabled:cursor-not-allowed shadow"
-                    ?disabled=${this.isLoading || !this.userInput.trim() || !areAllKeysConfigured}
+                    ?disabled=${this.isLoading || (!this.userInput.trim() && this.attachedImages.length === 0) || !areAllKeysConfigured}
                     aria-label="Send message"
                   >
                       ${this.isLoading ? html`<loading-spinner class="h-6 w-6 text-white"></loading-spinner>` : html`

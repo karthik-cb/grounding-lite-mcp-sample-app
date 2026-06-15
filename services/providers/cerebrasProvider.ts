@@ -20,18 +20,32 @@ import type { Client as McpClient } from "@modelcontextprotocol/sdk/client";
 import { trace } from '../../utils/logger.js';
 import type { AIProvider, InitSessionOptions, TurnResult } from './types.js';
 
+/** Read a numeric env var, falling back when unset/blank/invalid (0 is honored). */
+const envNum = (name: string, fallback: number): number => {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+};
+
 const DEFAULT_MODEL = 'gemma-4-31b-trial';
-/** Cerebras per-request image limit (private preview). */
-const MAX_IMAGES = 5;
 /** Safety cap on the agentic tool-calling loop to avoid runaway iterations. */
 const MAX_TOOL_ITERATIONS = 10;
 
+// Per-request limits. These shift between private preview and public availability,
+// so they're env-configurable (with sensible preview defaults).
+//   CEREBRAS_MAX_IMAGES      — images per request (default 5)
+//   CEREBRAS_MAX_PAYLOAD_MB  — total image payload budget per request (default 10)
+const MAX_IMAGES = envNum('CEREBRAS_MAX_IMAGES', 5);
+const MAX_PAYLOAD_MB = envNum('CEREBRAS_MAX_PAYLOAD_MB', 10);
+const MAX_PAYLOAD_BYTES = MAX_PAYLOAD_MB * 1024 * 1024;
+
 // Generation settings. Defaults follow Cerebras' recommendation for Gemma at
 // `reasoning_effort: medium` (competitive with Gemini): temperature 0.8, top_p 0.95.
-// reasoning_effort is env-overridable for A/B experimentation during the preview.
+// All are env-overridable for A/B experimentation during the preview.
 const REASONING_EFFORT = (process.env.CEREBRAS_REASONING_EFFORT || 'medium').toLowerCase();
-const TEMPERATURE = 0.8;
-const TOP_P = 0.95;
+const TEMPERATURE = envNum('CEREBRAS_TEMPERATURE', 0.8);
+const TOP_P = envNum('CEREBRAS_TOP_P', 0.95);
 // Strict tool calling (constrained decoding) is recommended for reliable tool use.
 // Toggle off via CEREBRAS_STRICT_TOOLS=false if a tool schema ever trips it up.
 const STRICT_TOOLS = (process.env.CEREBRAS_STRICT_TOOLS || 'true').toLowerCase() !== 'false';
@@ -155,6 +169,7 @@ const extractToolText = (mcpResult: any): string => {
 export class CerebrasProvider implements AIProvider {
   readonly modelName: string;
   readonly displayName = 'Gemma';
+  readonly limits = { maxImages: MAX_IMAGES, maxPayloadMb: MAX_PAYLOAD_MB };
 
   private client: Cerebras | null = null;
   private mcpClient: McpClient | null = null;
@@ -224,6 +239,11 @@ export class CerebrasProvider implements AIProvider {
     if (imgs.length > 0) {
       // Validate/normalize each image to a supported base64 PNG/JPEG data URL.
       const normalized = imgs.map(normalizeImageDataUrl);
+      // Enforce the per-request payload budget (the base64 data URLs dominate the body).
+      const totalBytes = normalized.reduce((sum, url) => sum + url.length, 0);
+      if (totalBytes > MAX_PAYLOAD_BYTES) {
+        throw new Error(`Image payload too large: ${(totalBytes / (1024 * 1024)).toFixed(1)} MB exceeds the ${MAX_PAYLOAD_MB} MB per-request limit. Attach fewer or smaller images.`);
+      }
       this.messages.push({
         role: 'user',
         content: [

@@ -45,9 +45,11 @@ async function main() {
     console.log(`[start] Attempting to start server on port ${PORT}...`);
 
     const app = express();
-    // Raise the JSON body limit so base64-encoded image attachments (up to 5,
-    // consumed by the Cerebras/Gemma multimodal path) fit in the request body.
-    app.use(bodyParser.json({ limit: '25mb' }));
+    // Raise the JSON body limit so base64-encoded image attachments fit in the
+    // request body. Tracks the configurable Cerebras payload budget
+    // (CEREBRAS_MAX_PAYLOAD_MB, default 10) plus headroom for the JSON/text wrapper.
+    const maxPayloadMb = Number(process.env.CEREBRAS_MAX_PAYLOAD_MB) || 10;
+    app.use(bodyParser.json({ limit: `${maxPayloadMb + 2}mb` }));
 
     app.post('/api/init-chat', async (req, res) => {
       console.log('[start] /api/init-chat called');
