@@ -49,6 +49,11 @@ fi
 SERVER_API_KEY=$(get_env_key "SERVER_API_KEY")
 MAPS_API_KEY=$(get_env_key "MAPS_API_KEY")
 
+# Optional: AI provider selection (defaults to "gemini" when unset).
+AI_PROVIDER=$(get_env_key "AI_PROVIDER")
+CEREBRAS_API_KEY=$(get_env_key "CEREBRAS_API_KEY")
+CEREBRAS_MODEL=$(get_env_key "CEREBRAS_MODEL")
+
 # Validate that keys were successfully read
 if [ -z "$SERVER_API_KEY" ]; then
     echo "Error: SERVER_API_KEY is missing or empty in $ENV_FILE"
@@ -60,9 +65,22 @@ if [ -z "$MAPS_API_KEY" ]; then
     exit 1
 fi
 
+# When deploying with the Cerebras/Gemma provider, the API key is required.
+if [ "$AI_PROVIDER" = "cerebras" ] && [ -z "$CEREBRAS_API_KEY" ]; then
+    echo "Error: AI_PROVIDER=cerebras but CEREBRAS_API_KEY is missing or empty in $ENV_FILE"
+    exit 1
+fi
+
+# Build the env-vars list, appending Cerebras settings only when present.
+ENV_VARS="SERVER_API_KEY=${SERVER_API_KEY},MAPS_API_KEY=${MAPS_API_KEY}"
+[ -n "$AI_PROVIDER" ] && ENV_VARS="${ENV_VARS},AI_PROVIDER=${AI_PROVIDER}"
+[ -n "$CEREBRAS_API_KEY" ] && ENV_VARS="${ENV_VARS},CEREBRAS_API_KEY=${CEREBRAS_API_KEY}"
+[ -n "$CEREBRAS_MODEL" ] && ENV_VARS="${ENV_VARS},CEREBRAS_MODEL=${CEREBRAS_MODEL}"
+
 echo "--- Deploying to Google Cloud Run ---"
 echo "Project: $GCP_PROJECT_ID"
 echo "Region: $GCP_REGION"
+echo "AI Provider: ${AI_PROVIDER:-gemini (default)}"
 
 # Execute the gcloud deploy command, passing the read variables securely
 gcloud run deploy grounding-lite-app \
@@ -70,7 +88,7 @@ gcloud run deploy grounding-lite-app \
     --region "$GCP_REGION" \
     --platform managed \
     --allow-unauthenticated \
-    --set-env-vars SERVER_API_KEY="$SERVER_API_KEY",MAPS_API_KEY="$MAPS_API_KEY" \
+    --set-env-vars "$ENV_VARS" \
     --project "$GCP_PROJECT_ID"
 
 echo "Deployment command completed."

@@ -105,6 +105,31 @@ For the server-side (Maps Platform MCP calls and Gemini API calls), use:
 SERVER_API_KEY="YOUR_SERVER_API_KEY_HERE"
 ```
 
+### Choosing the AI provider (Gemini or Cerebras/Gemma)
+
+The conversational agent can be driven by either the Gemini API (default) or by
+**Gemma-4-31B on Cerebras inference**. Select the provider with `AI_PROVIDER`:
+
+```
+# "gemini" (default) or "cerebras"
+AI_PROVIDER="cerebras"
+
+# Required when AI_PROVIDER=cerebras
+CEREBRAS_API_KEY="YOUR_CEREBRAS_API_KEY"
+
+# Optional: override the Cerebras model id (defaults to "gemma-4-31b-trial")
+CEREBRAS_MODEL="gemma-4-31b-trial"
+```
+
+`SERVER_API_KEY` is still required regardless of provider, because it
+authenticates the Google Maps Grounding Lite MCP server that supplies the
+`search_places`, `lookup_weather`, and `compute_routes` tools.
+
+The Cerebras path additionally supports **multimodal image input**: `POST /api/chat`
+accepts an optional `images` array of base64 data URLs (`data:image/png;base64,...`,
+PNG/JPEG only, up to 5 per request). The frontend upload UI for this is a planned
+follow-up; the backend already accepts and forwards the images.
+
 ## Architecture
 
 

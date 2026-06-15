@@ -14,6 +14,7 @@
     "start:prod": "node dist/start.js"
   },
   "dependencies": {
+    "@cerebras/cerebras_cloud_sdk": "^1.64.1",
     "@google/genai": "1.29.0",
     "@modelcontextprotocol/sdk": "1.24.0",
     "axios": "^1.13.2",

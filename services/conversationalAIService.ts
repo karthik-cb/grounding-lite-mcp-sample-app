@@ -15,39 +15,42 @@
  */
 
 import { trace } from '../utils/logger.js';
-import { Agent as HttpsAgent } from 'https';
-import type { Part as _Part, FunctionResponsePart as _FunctionResponsePart, Tool as _Tool } from "@google/genai";
-import {
-  GoogleGenAI,
-  Chat,
-  GenerateContentResponse,
-  Content,
-  HarmCategory,
-  HarmBlockThreshold,
-  mcpToTool, // Import mcpToTool
-  FinishReason,
-  FunctionCall
-} from "@google/genai";
+import type { Content } from "@google/genai";
 import { ToolExchange } from '../types.js';
 import { Client as McpClient } from "@modelcontextprotocol/sdk/client";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"; // Corrected path based on feedback
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { callRoutesApiV2 } from './complementaryServices.js';
-
+import type { AIProvider } from './providers/types.js';
+import { GeminiProvider } from './providers/geminiProvider.js';
+import { CerebrasProvider } from './providers/cerebrasProvider.js';
 
 // Constants for session management
 const MAX_TURNS = 40; // User requested 40 prompts
 const MAX_INACTIVITY_MS = 30 * 60 * 1000; // User requested 30 minutes
 
-let chat: Chat | null = null;
 let turnCount = 0;
 let lastInteractionTimestamp = 0;
-const MODEL_NAME = 'gemini-2.5-flash-preview-09-2025'; //'gemini-3-flash-preview-09-2025';//'gemini-2.5-flash-preview-09-2025';//gemini-3-flash';// '
 
-let ai: GoogleGenAI | null = null;
+// The active conversational AI backend (Gemini by default, Cerebras/Gemma opt-in).
+let provider: AIProvider | null = null;
 export let mcpClientInstance: McpClient | null = null;
 
 // Module-level status handler for MCP tool interception
 let currentStatusHandler: ((status: string) => void) | null = null;
+
+/**
+ * Selects the AI provider based on the AI_PROVIDER env var ("gemini" | "cerebras").
+ * Defaults to Gemini so existing deployments are unaffected.
+ */
+const createProvider = (): AIProvider => {
+  const name = (process.env.AI_PROVIDER || 'gemini').toLowerCase();
+  if (name === 'cerebras' || name === 'gemma') {
+    trace('[Provider] AI_PROVIDER=cerebras -> using Cerebras/Gemma provider.');
+    return new CerebrasProvider();
+  }
+  trace('[Provider] Using Gemini provider (default).');
+  return new GeminiProvider();
+};
 
 // Base System Instruction
 const baseSystemInstruction = `You are a friendly, expert conversational assistant named 'Grounding Lite API'.
@@ -164,19 +167,8 @@ export const initChatSession = async (initialHistory?: Content[]): Promise<{ suc
   const serverApiKey = process.env.SERVER_API_KEY;
   console.log(`[initChatSession] Checking for SERVER_API_KEY... ${serverApiKey ? 'found.' : 'not set or empty.'}`);
   if (!serverApiKey) {
-    console.error("CRITICAL: SERVER_API_KEY environment variable is not set for Gemini API calls.");
-    return { success: false, modelName: MODEL_NAME };
-  }
-
-  // Initialize AI client if not already done
-  try {
-    if (!ai) {
-      console.log("[initChatSession] Initializing GoogleGenAI client...");
-      ai = new GoogleGenAI({ apiKey: serverApiKey });
-    }
-  } catch (e) {
-    console.error("[initChatSession] Failed to initialize GoogleGenAI client:", e);
-    return { success: false, modelName: MODEL_NAME };
+    console.error("CRITICAL: SERVER_API_KEY environment variable is not set (required for the Google Maps MCP server).");
+    return { success: false, modelName: provider?.modelName || 'unknown' };
   }
 
   // Reuse MCP client if already initialized, but ALWAYS reset the chat session.
@@ -185,7 +177,7 @@ export const initChatSession = async (initialHistory?: Content[]): Promise<{ suc
   } else {
     try {
       console.log("[initChatSession] Starting MCP setup...");
-      // 1. Setup REMOTE MCP Client with StreamableHTTPClientTransport (for internal use by services)
+      // Setup REMOTE MCP Client with StreamableHTTPClientTransport (Google Maps MCP server).
       const remoteClient = new McpClient({ name: "GroundingLiteAppRemoteMcpClient", version: "1.0.0" });
       await remoteClient.connect(new StreamableHTTPClientTransport(
         new URL(MCP_URL),
@@ -198,74 +190,50 @@ export const initChatSession = async (initialHistory?: Content[]): Promise<{ suc
           }
         }
       ));
-      mcpClientInstance = remoteClient; // This is the remote client for services
+
+      // Wrap callTool ONCE per client so every tool execution (Gemini auto-loop or
+      // the Cerebras manual loop) emits a UI status update. Wrapping here (rather
+      // than on every initChatSession) avoids stacking wrappers on session refresh.
+      const originalCallTool = remoteClient.callTool.bind(remoteClient);
+      remoteClient.callTool = async (params: any, resultSchema?: any) => {
+        if (currentStatusHandler) {
+          currentStatusHandler(`Calling <b>${params.name}</b>...\nPlease wait.`);
+        }
+        return originalCallTool(params, resultSchema);
+      };
+
+      mcpClientInstance = remoteClient;
       trace("REMOTE MCP Client connected successfully.");
     } catch (error) {
       console.error("Error initializing MCP client:", error);
       mcpClientInstance = null;
-      return { success: false, modelName: MODEL_NAME };
+      return { success: false, modelName: provider?.modelName || 'unknown' };
     }
   }
 
   try {
-    // 2. Use the REMOTE MCP Client for Gemini tools directly
-    // This bypasses the local MCP server wrapper and connects Gemini directly to the Google Maps MCP server.
-    let toolsForGemini = [mcpToTool(mcpClientInstance)];
-
-    // Wrap the tool execution to update status
-    if (toolsForGemini.length > 0) {
-        // We can't easily wrap the execution here because mcpToTool returns a Tool object, 
-        // and the execution logic is internal to the SDK or the McpClient.
-        // However, we can wrap the McpClient's callTool method!
-      const originalCallTool = mcpClientInstance.callTool.bind(mcpClientInstance);
-      mcpClientInstance.callTool = async (params: any, resultSchema?: any) => {
-            if (currentStatusHandler) {
-              currentStatusHandler(`Calling <b>${params.name}</b>...\nPlease wait.`);
-            }
-            return originalCallTool(params, resultSchema);
-        };
-    }
-
-    if (toolsForGemini.length === 0) {
-        console.warn("MCP client reported no tools (remoteTools map is empty or client not initialized), or mcpToTool conversion resulted in no tools. Place search functionality might be unavailable to Gemini.");
-    } else {
-        // MODIFIED LOGGING: Avoid JSON.stringify on complex objects
-        trace(`Tools for Gemini (from MCP): ${toolsForGemini.length} tool(s) configured.`);
+    if (!provider) {
+      provider = createProvider();
     }
 
     const dynamicSystemInstruction = getSystemInstruction();
-
-    chat = ai.chats.create({
-      model: MODEL_NAME,
-      history: initialHistory || [],
-      config: {
-        temperature: 0.6,
-        thinkingConfig: {
-          thinkingBudget: 512
-        },
-        systemInstruction: dynamicSystemInstruction,
-        tools: toolsForGemini.length > 0 ? toolsForGemini : undefined,
-        safetySettings: [
-          { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
-          { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE },
-          { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE },
-          { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE },
-        ],
-      }
+    await provider.initSession({
+      mcpClient: mcpClientInstance,
+      systemInstruction: dynamicSystemInstruction,
+      initialHistory,
     });
 
     // Reset session tracking variables
     turnCount = 0;
     lastInteractionTimestamp = Date.now();
 
-    trace("Gemini chat session initialized with MCP tools and current time context.");
-    return { success: true, modelName: MODEL_NAME };
+    trace(`Chat session initialized with provider '${provider.displayName}' (model: ${provider.modelName}).`);
+    return { success: true, modelName: provider.modelName };
   } catch (error) {
-    console.error("Error initializing chat session with MCP integration:", error);
-    chat = null;
-    return { success: false, modelName: MODEL_NAME };
+    console.error("Error initializing chat session with provider:", error);
+    return { success: false, modelName: provider?.modelName || 'unknown' };
   } finally {
-    // Ensure the handler is reset after the turn is complete, regardless of success/failure
+    // Ensure the handler is reset after init, regardless of success/failure
     currentStatusHandler = null;
   }
 };
@@ -298,117 +266,73 @@ const cleanToolResponseForDisplay = (toolName: string, response: any): any => {
     // Check if the response has a deeply nested route field (structure provided by MCP server)
     // Handle both wrapped { response: { route: ... } } and unwrapped { route: ... } or { routes: [...] }
     const routeData = response?.response?.route || response?.route || (response?.routes && response.routes[0]);
-    
+
     if (routeData && typeof routeData === 'object') {
       // Create a deep clone to avoid modifying the original data structure
       const cleanedResponse = JSON.parse(JSON.stringify(response));
 
       // NOTE: We previously removed encodedPolyline here, but chat-app.ts NEEDS it to draw the route on the map.
       // So we must PRESERVE it.
-      // if (cleanedResponse.response && cleanedResponse.response.route) {
-      //     if (cleanedResponse.response.route.encodedPolyline) {
-      //       delete cleanedResponse.response.route.encodedPolyline;
-      //     }
-      // } ...
-      
+
       return cleanedResponse;
     }
   }
   return response; // Return original response if no cleaning is needed
 };
 
-// Returns the final response and the content of the entire turn (user msg, tool calls/responses, model response)
-// Returns the final response and the content of the entire turn (user msg, tool calls/responses, model response)
+// Returns the final response and the content of the entire turn (user msg, tool calls/responses, model response).
 export const sendMessageToAI = async (
   userMessageContent: string,
-  onStatusUpdate?: (status: string) => void
-): Promise<{ response: GenerateContentResponse, turnContent: Content[], toolExchanges: ToolExchange[], sessionRefreshWarning?: string }> => {
+  onStatusUpdate?: (status: string) => void,
+  images?: string[]
+): Promise<{ response: { text: string } & Record<string, unknown>, turnContent: Content[], toolExchanges: ToolExchange[], sessionRefreshWarning?: string }> => {
 
   if (onStatusUpdate) {
     currentStatusHandler = onStatusUpdate;
     // Initial status, 2 lines
-    onStatusUpdate("Calling <b>Gemini</b>...\nPlease wait.");
+    onStatusUpdate(`Calling <b>${provider?.displayName || 'AI'}</b>...\nPlease wait.`);
   }
 
   const now = Date.now();
   const timeElapsed = now - lastInteractionTimestamp;
   let sessionRefreshWarning: string | undefined = undefined;
 
-  const shouldRefresh = !chat || turnCount >= MAX_TURNS || timeElapsed >= MAX_INACTIVITY_MS;
+  const shouldRefresh = !provider || !provider.isInitialized() || turnCount >= MAX_TURNS || timeElapsed >= MAX_INACTIVITY_MS;
 
   if (shouldRefresh) {
     let reason = "";
-    if (!chat) reason = "The chat session was not initialized.";
+    if (!provider || !provider.isInitialized()) reason = "The chat session was not initialized.";
     else if (turnCount >= MAX_TURNS) reason = `The conversation reached the maximum limit of ${MAX_TURNS} prompts.`;
-    else if (timeElapsed >= MAX_INACTIVITY_MS) reason = `The conversation timed out after 20 minutes of inactivity.`;
+    else if (timeElapsed >= MAX_INACTIVITY_MS) reason = `The conversation timed out after 30 minutes of inactivity.`;
 
     sessionRefreshWarning = `**Session Refreshed:** ${reason} Your chat history has been cleared.`;
     trace(`[Session Manager] Refreshing chat session. Reason: ${reason}`);
 
     const initialized = await initChatSession();
-    if (!initialized || !chat) {
+    if (!initialized.success || !provider) {
        console.error("Chat session not initialized and re-initialization failed.");
        throw new Error("Chat session is not available.");
     }
+    // initChatSession's finally clears the status handler; restore it for this turn.
+    if (onStatusUpdate) {
+      currentStatusHandler = onStatusUpdate;
+    }
   }
-   if (!ai) { // Should be caught by initChatSession, but good to double check
-    throw new Error("Gemini API client not initialized.");
-  }
-
-  // FIX: Property 'history' is private. Use getHistory() to access the chat history.
-  const historyBefore = await chat!.getHistory();
-  const historyBeforeLength = historyBefore.length;
 
   try {
-    // Use sendMessage for a single, complete response
-    const response = await chat!.sendMessage({ message: userMessageContent });
+    const { response, turnContent, blocked } = await provider!.sendMessage(userMessageContent, images);
 
     // Update status to processing after response (even if tools were used)
     if (onStatusUpdate) {
-        // Final processing status, 2 lines
         onStatusUpdate("Processing AI response...\nPreparing final output.");
     }
 
-    // Check if the response was blocked due to safety settings
-    if (response.candidates && response.candidates.length > 0 && response.candidates[0].finishReason === 'SAFETY') {
-      const safetyMessage = "The response was blocked because it was flagged for safety reasons. This can sometimes happen with general queries. Please try rephrasing your request to be more specific.";
-
-      // Manually construct a response object to send to the UI
-      // The SDK's response object has methods (e.g., text()) that are lost when spreading.
-      // We must create a new object that conforms to the GenerateContentResponse interface.
-      const safeResponse: GenerateContentResponse = {
-        ...response,
-        candidates: [
-          {
-            ...(response.candidates[0] || {}), // Guard against undefined candidate
-            finishReason: FinishReason.STOP,
-            content: {
-              parts: [{ text: safetyMessage }],
-              role: 'model'
-            }
-          }
-        ],
-        // Implement the required properties from the GenerateContentResponse interface
-        text: safetyMessage,
-        functionCalls: [] as FunctionCall[],
-        data: "",
-        executableCode: "",
-        codeExecutionResult: "",
-      };
-      // We will still process the original turn content for logging
-      const historyAfter = await chat!.getHistory();
-      const turnContent = historyAfter.slice(historyBeforeLength);
-      return { response: safeResponse, turnContent, toolExchanges: [], sessionRefreshWarning };
+    // Safety/blocked turns: skip tool-exchange processing entirely.
+    if (blocked) {
+      turnCount++;
+      lastInteractionTimestamp = Date.now();
+      return { response, turnContent, toolExchanges: [], sessionRefreshWarning };
     }
-
-    // Update session tracking
-    turnCount++;
-    lastInteractionTimestamp = Date.now();
-
-    // After the call, the chat's history is updated with the full turn.
-    const historyAfter = await chat!.getHistory();
-    // We extract the parts that were just added.
-    const turnContent = historyAfter.slice(historyBeforeLength);
 
     // Collect all tool calls and responses into ToolExchange objects
     const toolExchanges: ToolExchange[] = [];
@@ -444,10 +368,9 @@ export const sendMessageToAI = async (
                 try {
                   // Clean the response for display. This directly modifies the `turnContent` object
                   // because `functionResponse` is a reference to `part.functionResponse`.
-                  
+
                   // COMPATIBILITY NOTE: Remote MCP server returns raw JSON (e.g. { places: ... }).
                   // We do NOT wrap it here because chat-app.ts needs access to the 'content' property of the result.
-                  // Instead, we ensure chat-app.ts and cleanToolResponseForDisplay handle both formats.
 
                   const cleanedResponse = cleanToolResponseForDisplay(call.name, functionResponse.response);
                   functionResponse.response = cleanedResponse;
@@ -477,7 +400,7 @@ export const sendMessageToAI = async (
                       // Hydrate route data with polyline from Routes API if missing
                       try {
                           trace(`[MCP] Hydrating compute_routes response with polyline...`);
-                          
+
                           // Parse the inner JSON from content[0].text
                           let innerJson: any = null;
                           let textContentPart: any = null;
@@ -502,7 +425,7 @@ export const sendMessageToAI = async (
                                   const transformed: Record<string, any> = {};
                                   const placeId = wp.placeId || wp.place_id;
                                   const latLng = wp.latLng || wp.lat_lng;
-                                  
+
                                   if (placeId) {
                                       transformed.placeId = placeId;
                                   } else if (latLng) {
@@ -520,7 +443,7 @@ export const sendMessageToAI = async (
 
                               const origin = call.args.origin ? transformWaypoint(call.args.origin) : undefined;
                               const destination = call.args.destination ? transformWaypoint(call.args.destination) : undefined;
-                              
+
                               if (origin && destination) {
                                   const routesParams: Record<string, any> = {
                                       origin,
@@ -532,16 +455,16 @@ export const sendMessageToAI = async (
                                       languageCode: 'en-US',
                                       units: 'METRIC'
                                   };
-                                  
+
                                   const { data: routesData, error: routesError } = await callRoutesApiV2(routesParams);
-                                  
+
                                   trace(`[MCP] Routes API response:`, routesData ? "Success" : "Error", routesError);
 
                                   if (routesData && routesData.routes && routesData.routes.length > 0) {
                                       const polyline = routesData.routes[0].polyline?.encodedPolyline;
                                       if (polyline) {
                                           trace(`[MCP] Successfully fetched polyline. Length: ${polyline.length}`);
-                                          
+
                                           // Merge into innerJson
                                           if (innerJson.routes && innerJson.routes.length > 0) {
                                               trace(`[MCP] Injecting polyline into innerJson.routes[0]`);
@@ -568,7 +491,6 @@ export const sendMessageToAI = async (
                                           // Save back to textContentPart
                                           if (textContentPart) {
                                               textContentPart.text = JSON.stringify(innerJson);
-                                              // Also update responseJson if it was unwrapped (reference)
                                           }
                                       } else {
                                           trace(`[MCP] Routes API returned routes but NO polyline.`);
@@ -602,30 +524,11 @@ export const sendMessageToAI = async (
       }
     }
 
-    // --- DEBUG LOGGING ADDED ---
-    // --- DEBUG LOGGING ADDED ---
-    trace("[sendMessageToAI] Raw response from Gemini:", response);
+    trace("[sendMessageToAI] Final response text:", response.text);
     trace("[sendMessageToAI] Full turn content added to history:", turnContent);
     if (toolExchanges.length > 0) {
       trace(`[sendMessageToAI] Detected ${toolExchanges.length} tool exchanges.`);
     }
-    // --- END DEBUG LOGGING ---
-
-    // Create a serializable response object.
-    // The SDK response object might use getters that aren't serialized by JSON.stringify.
-    // We explicitly extract the text content.
-    let textContent = "";
-    try {
-        // @ts-ignore: Handle potential getter or method
-        textContent = typeof response.text === 'function' ? response.text() : response.text;
-    } catch (e) {
-        console.warn("Could not extract text from response:", e);
-    }
-
-    const serializableResponse = {
-        ...response,
-        text: textContent || ""
-    } as GenerateContentResponse;
 
     // Update session state
     turnCount++;
@@ -633,11 +536,11 @@ export const sendMessageToAI = async (
 
     trace(`[Session Manager] Turn completed. New turnCount: ${turnCount}, Timestamp: ${lastInteractionTimestamp}`);
 
-    return { response: serializableResponse, turnContent, toolExchanges, sessionRefreshWarning };
+    return { response, turnContent, toolExchanges, sessionRefreshWarning };
   } catch (error) {
     console.error("Error sending message to AI:", error);
     if (error instanceof Error) {
-        throw new Error(`Gemini API Error: ${error.message}`);
+        throw new Error(`AI Provider Error: ${error.message}`);
     }
     throw new Error("An unknown error occurred while communicating with the AI.");
   } finally {
@@ -646,5 +549,4 @@ export const sendMessageToAI = async (
   }
 };
 
-export const isGeminiClientInitialized = (): boolean => !!ai;
-// export { mcpClientInstance }; // Export moved to line 45
+export const isAIClientInitialized = (): boolean => !!provider && provider.isInitialized();

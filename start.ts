@@ -45,7 +45,9 @@ async function main() {
     console.log(`[start] Attempting to start server on port ${PORT}...`);
 
     const app = express();
-    app.use(bodyParser.json());
+    // Raise the JSON body limit so base64-encoded image attachments (up to 5,
+    // consumed by the Cerebras/Gemma multimodal path) fit in the request body.
+    app.use(bodyParser.json({ limit: '25mb' }));
 
     app.post('/api/init-chat', async (req, res) => {
       console.log('[start] /api/init-chat called');
@@ -73,18 +75,24 @@ async function main() {
       };
 
       try {
-        const { message } = req.body;
+        const { message, images } = req.body;
         if (!message) {
           sendEvent({ error: 'Message is required.' });
           res.end();
           return;
         }
 
+        // Optional base64 image data URLs (data:image/png;base64,...). Only the
+        // Cerebras/Gemma provider currently consumes these; ignored by Gemini.
+        const imageList: string[] | undefined = Array.isArray(images)
+          ? images.filter((img: unknown): img is string => typeof img === 'string')
+          : undefined;
+
         const statusCallback = (status: string) => {
           sendEvent({ status });
         };
 
-        const result = await sendMessageToAI(message, statusCallback);
+        const result = await sendMessageToAI(message, statusCallback, imageList);
         sendEvent({ result });
 
       } catch (error) {
